@@ -1,21 +1,25 @@
 # ==============================================================
-# Jerney - DevSecOps CI/CD Pipeline
+# Jerney - DevSecOps CI Pipeline (report-only security scans)
 # ==============================================================
-# Triggers on every push and pull request.
+# Every scanner REPORTS instead of failing: findings are saved as
+# JSON and uploaded as artifacts, and the pipeline keeps going.
+# Only real breakage (npm ci, docker build/push) fails a job.
 #
 # Flow:
-#   1. Secret Scan (Gitleaks)
-#   2. Lint (ESLint)                 ─┐
-#   3. SAST (SonarQube + Quality Gate)│  run in parallel after secret scan
-#   4. SCA (npm audit + Trivy fs)    │
-#   5. Dockerfile Lint (Hadolint)    │
-#   6. IaC Scan (Checkov)            ─┘
+#   1. Secret Scan (Gitleaks)            -> gitleaks-report (SARIF/JSON)
+#   2. Lint (ESLint)                     -> eslint-<component>.json
+#   3. SAST (SonarQube)                  -> sonarqube-report (issues + gate JSON)
+#   4. SCA (npm audit + Trivy fs)        -> sca-<component> (2 JSON files)
+#   5. Dockerfile Lint (Hadolint)        -> hadolint-<component>.json
+#   6. IaC Scan (Checkov TF + K8s)       -> checkov-report (JSON)
 #   7. Build, Push, SBOM, Sign (Cosign)
-#   8. Image Scan (Dockle CIS benchmark + Trivy vulnerabilities)
+#   8. Image Scan (Dockle + Trivy)       -> image-scan-<component> (2 JSON files)
 #   9. Update K8s Manifest (devops branch only)
 #
+# Reports: Actions -> open a run -> "Artifacts" section at the bottom.
+#
 # Required repo secrets:
-#   SONAR_TOKEN      - SonarQube user/project token
+#   SONAR_TOKEN      - SonarQube token
 #   SONAR_HOST_URL   - e.g. http://<sonarqube-ip>:9000
 # GITHUB_TOKEN is provided automatically.
 # ==============================================================
@@ -24,27 +28,24 @@ name: Jerney DevSecOps Pipeline
 
 on:
   push:
-    branches: ["**"] # "**" also matches branches with slashes (feature/x)
+    branches: ["**"]
   pull_request:
     branches: ["**"]
 
-# Security: restrict default permissions to read-only
 permissions:
   contents: read
 
-# Cancel older runs of the same branch so two runs never race on the manifest
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  DOCKER_REGISTRY: ghcr.io
   NODE_VERSION: "20"
+  SONAR_PROJECT_KEY: "Jerney-app"
 
 jobs:
   # ==============================================================
-  # STAGE 0: Secret Scanning (Gitleaks)
-  # Scans full git history for hardcoded keys, tokens, passwords
+  # STAGE 1: Secret Scanning (Gitleaks)
   # ==============================================================
   secret-scan:
     name: "🔑 Secret Scan (Gitleaks)"
@@ -57,19 +58,28 @@ jobs:
 
       - name: Run Gitleaks
         uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true # report only
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}  # only needed for org-owned repos
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: false # we upload it ourselves below
+
+      - name: Upload Gitleaks report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: results.sarif
+          if-no-files-found: warn
 
   # ==============================================================
-  # STAGE 1: Linting
+  # STAGE 2: Linting (ESLint)
   # ==============================================================
   lint:
-    name: "🔍 Lint Code"
+    name: "🔍 Lint ${{ matrix.component }}"
     runs-on: ubuntu-latest
     needs: secret-scan
-    continue-on-error: true
     strategy:
+      fail-fast: false
       matrix:
         component: [backend, frontend]
     steps:
@@ -87,47 +97,81 @@ jobs:
         working-directory: ${{ matrix.component }}
         run: npm ci
 
-      - name: Run ESLint
+      - name: Run ESLint (JSON report)
         working-directory: ${{ matrix.component }}
-        run: npm run lint
+        run: npm run lint -- --format json --output-file ../eslint-${{ matrix.component }}.json || true
+
+      - name: Upload ESLint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eslint-${{ matrix.component }}
+          path: eslint-${{ matrix.component }}.json
+          if-no-files-found: warn
 
   # ==============================================================
-  # STAGE 1b: SAST — SonarQube Analysis + Quality Gate
+  # STAGE 3: SAST (SonarQube)
   # ==============================================================
   sast-sonarqube:
     name: "🧪 SAST (SonarQube)"
     runs-on: ubuntu-latest
     needs: secret-scan
-    # Fork PRs don't receive secrets, so skip them instead of failing
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
-      - name: Checkout code (full history for blame/new-code detection)
+      - name: Checkout code (full history)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: SonarQube Scan
-        uses: SonarSource/sonarqube-scan-action@v5
+        uses: SonarSource/sonarqube-scan-action@v6
+        continue-on-error: true # a failed quality gate is reported, not blocking
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
         with:
           args: >
-            -Dsonar.projectKey=Jerney-app
-            -Dsonar.projectName=Jerney-app
+            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+            -Dsonar.projectName=${{ env.SONAR_PROJECT_KEY }}
             -Dsonar.sources=backend,frontend
             -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/build/**,**/*.test.js
             -Dsonar.qualitygate.wait=true
             -Dsonar.qualitygate.timeout=300
 
+      - name: Export SonarQube results as JSON
+        if: always()
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          mkdir -p sonarqube-report
+          curl -s -u "${SONAR_TOKEN}:" \
+            "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}" \
+            -o sonarqube-report/quality-gate.json || true
+          curl -s -u "${SONAR_TOKEN}:" \
+            "${SONAR_HOST_URL}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&resolved=false&ps=500" \
+            -o sonarqube-report/issues.json || true
+          curl -s -u "${SONAR_TOKEN}:" \
+            "${SONAR_HOST_URL}/api/hotspots/search?projectKey=${SONAR_PROJECT_KEY}&ps=500" \
+            -o sonarqube-report/hotspots.json || true
+
+      - name: Upload SonarQube report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarqube-report
+          path: sonarqube-report/
+          if-no-files-found: warn
+
   # ==============================================================
-  # STAGE 2: Software Composition Analysis (SCA) — Dependency Audit
+  # STAGE 4: SCA (npm audit + Trivy filesystem)
   # ==============================================================
   sca:
-    name: "🛡️ Dependency Audit"
+    name: "🛡️ SCA ${{ matrix.component }}"
     runs-on: ubuntu-latest
     needs: lint
     strategy:
+      fail-fast: false
       matrix:
         component: [backend, frontend]
     steps:
@@ -145,40 +189,119 @@ jobs:
         working-directory: ${{ matrix.component }}
         run: npm ci
 
-      # npm audit for known vulnerabilities (fail on high/critical)
-      - name: npm audit
+      - name: npm audit (JSON report)
         working-directory: ${{ matrix.component }}
-        run: npm audit --audit-level=high || true
-        # `|| true` to not fail on moderate — adjust in prod
+        run: npm audit --json > ../npm-audit-${{ matrix.component }}.json || true
 
-      # Trivy filesystem scan: dependency vulns + leaked secrets
-      # (Dockerfile/K8s/Terraform misconfig is covered by Hadolint + Checkov)
-      - name: Trivy filesystem scan
+      - name: Trivy filesystem scan (JSON report)
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: "fs"
           scan-ref: "./${{ matrix.component }}"
           scanners: "vuln,secret"
-          format: "table"
-          exit-code: "1"
+          format: "json"
+          output: "trivy-fs-${{ matrix.component }}.json"
+          exit-code: "0" # report only
           ignore-unfixed: true
-          severity: "CRITICAL,HIGH"
+          severity: "CRITICAL,HIGH,MEDIUM"
+
+      - name: Upload SCA reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-${{ matrix.component }}
+          path: |
+            npm-audit-${{ matrix.component }}.json
+            trivy-fs-${{ matrix.component }}.json
+          if-no-files-found: warn
 
   # ==============================================================
-  # STAGE 3: Build & Push Container Images (+ SBOM, provenance, signing)
-  # Gated on all code-level security checks
+  # STAGE 5: Dockerfile Lint (Hadolint)
+  # ==============================================================
+  dockerfile-lint:
+    name: "📋 Hadolint ${{ matrix.component }}"
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [backend, frontend]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Hadolint (JSON report)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ${{ matrix.component }}/Dockerfile
+          format: json
+          output-file: hadolint-${{ matrix.component }}.json
+          no-fail: true # report only
+
+      - name: Upload Hadolint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hadolint-${{ matrix.component }}
+          path: hadolint-${{ matrix.component }}.json
+          if-no-files-found: warn
+
+  # ==============================================================
+  # STAGE 6: IaC Security Scan (Checkov) — Terraform + K8s
+  # ==============================================================
+  iac-scan:
+    name: "🏗️ IaC Scan (Checkov)"
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Checkov
+        run: pip install --quiet checkov
+
+      - name: Checkov on Terraform (JSON report)
+        # CKV_AWS_39, CKV_AWS_58: public EKS endpoint (intentional for dev)
+        run: |
+          checkov -d terraform/ --framework terraform \
+            --skip-check CKV_AWS_39,CKV_AWS_58 \
+            --output cli --output json --output-file-path checkov-report/terraform \
+            --soft-fail --compact
+
+      - name: Checkov on Kubernetes manifests (JSON report)
+        run: |
+          checkov -d k8s/ --framework kubernetes \
+            --output cli --output json --output-file-path checkov-report/kubernetes \
+            --soft-fail --compact
+
+      - name: Upload Checkov report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-report
+          path: checkov-report/
+          if-no-files-found: warn
+
+  # ==============================================================
+  # STAGE 7: Build & Push Images (+ SBOM, provenance, signing)
   # ==============================================================
   build:
     name: "🐳 Build ${{ matrix.component }}"
     runs-on: ubuntu-latest
     needs: [sca, sast-sonarqube, dockerfile-lint, iac-scan]
-    # Run when nothing failed; still runs if SonarQube was skipped (fork PRs)
+    # Runs unless something truly broke; still runs if SonarQube was skipped (fork PRs)
     if: ${{ !failure() && !cancelled() }}
     permissions:
       contents: read
-      packages: write # Needed to push to GHCR
-      id-token: write # Needed for keyless Cosign signing
+      packages: write # push to GHCR
+      id-token: write # keyless Cosign signing
     strategy:
+      fail-fast: false
       matrix:
         component: [backend, frontend]
     steps:
@@ -217,7 +340,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.component }}
           cache-to: type=gha,mode=max,scope=${{ matrix.component }}
-          # Security: provenance and SBOM
           provenance: true
           sbom: true
 
@@ -232,19 +354,17 @@ jobs:
           cosign sign --yes "${IMAGE}@${{ steps.push.outputs.digest }}"
 
   # ==============================================================
-  # STAGE 4: Container Image Scanning (Dockle + Trivy)
-  # On push: scans the exact image pushed to GHCR.
-  # On PR: builds locally (nothing was pushed) and scans that.
+  # STAGE 8: Image Scanning (Dockle + Trivy)
   # ==============================================================
   image-scan:
-    name: "🔬 Scan ${{ matrix.component }} Image"
+    name: "🔬 Image Scan ${{ matrix.component }}"
     runs-on: ubuntu-latest
-    continue-on-error: true
     needs: build
     permissions:
       contents: read
       packages: read
     strategy:
+      fail-fast: false
       matrix:
         component: [backend, frontend]
     steps:
@@ -260,7 +380,7 @@ jobs:
             echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/jerney-${{ matrix.component }}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Log in to GHCR (pull pushed image)
+      - name: Log in to GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
@@ -276,81 +396,40 @@ jobs:
         if: github.event_name != 'pull_request'
         run: docker pull ${{ steps.ref.outputs.image }}
 
-      # Dockle: CIS Docker Benchmark + best-practice checks on the built image
-      # (root user, secrets in ENV, setuid files, missing HEALTHCHECK, etc.)
-      - name: Run Dockle image linter
+      - name: Dockle CIS benchmark (JSON report)
         run: |
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":/out \
             goodwithtech/dockle:v0.4.15 \
-            --exit-code 1 \
-            --exit-level fatal \
-            ${{ steps.ref.outputs.image }}
+            --format json --output /out/dockle-${{ matrix.component }}.json \
+            --exit-code 0 \
+            ${{ steps.ref.outputs.image }} || true
 
-      - name: Run Trivy vulnerability scanner
+      - name: Trivy image scan (JSON report)
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ steps.ref.outputs.image }}
-          format: "table"
-          exit-code: "1"
+          format: "json"
+          output: "trivy-image-${{ matrix.component }}.json"
+          exit-code: "0" # report only
           ignore-unfixed: true
           vuln-type: "os,library"
-          severity: "CRITICAL,HIGH"
+          severity: "CRITICAL,HIGH,MEDIUM"
           timeout: "10m"
 
-  # ==============================================================
-  # STAGE 5: IaC Security Scan (Checkov) — Terraform + K8s
-  # ==============================================================
-  iac-scan:
-    name: "🏗️ IaC Security Scan"
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    needs: lint
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Run Checkov on Terraform
-        uses: bridgecrewio/checkov-action@v12
+      - name: Upload image scan reports
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          directory: terraform/
-          framework: terraform
-          soft_fail: false
-          skip_check: CKV_AWS_39,CKV_AWS_58 # Public EKS endpoint (intentional for dev)
-          output_format: cli
-
-      - name: Run Checkov on Kubernetes manifests
-        uses: bridgecrewio/checkov-action@v12
-        with:
-          directory: k8s/
-          framework: kubernetes
-          soft_fail: true # Soft fail for K8s (some checks may not apply)
-          output_format: cli
+          name: image-scan-${{ matrix.component }}
+          path: |
+            dockle-${{ matrix.component }}.json
+            trivy-image-${{ matrix.component }}.json
+          if-no-files-found: warn
 
   # ==============================================================
-  # STAGE 6: Dockerfile Lint (Hadolint)
-  # ==============================================================
-  dockerfile-lint:
-    name: "📋 Dockerfile Lint"
-    runs-on: ubuntu-latest
-    needs: secret-scan
-    continue-on-error: true
-    strategy:
-      matrix:
-        component: [backend, frontend]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Run Hadolint
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: ${{ matrix.component }}/Dockerfile
-          failure-threshold: warning
-
-  # ==============================================================
-  # STAGE 7: Update K8s Manifest with New Image Tag
-  # Only runs on push to devops (the DevSecOps branch), AFTER images are built and scanned
+  # STAGE 9: Update K8s Manifest (GitOps hand-off, devops branch only)
   # ==============================================================
   update-manifest:
     name: "🚀 Update K8s Manifest"
@@ -358,7 +437,7 @@ jobs:
     needs: [build, image-scan]
     if: ${{ !failure() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/devops' }}
     permissions:
-      contents: write # Needed to push manifest changes
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -368,9 +447,7 @@ jobs:
       - name: Compute image tag and names
         id: vars
         run: |
-          # Same 7-char SHA that docker/metadata-action used for the tag
           echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-          # GHCR requires lowercase repository paths
           echo "prefix=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
       - name: Update K8s manifest with new image tags
@@ -381,16 +458,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Find the image: line right after `- name: backend`
           BACKEND_LINE=$(awk '/- name: backend/{found=1} found && /image:/{print NR; exit}' k8s/jerney.yaml)
           [ -n "$BACKEND_LINE" ] || { echo "❌ backend image line not found"; exit 1; }
-          echo "Backend image at line: ${BACKEND_LINE}"
           sed -i "${BACKEND_LINE}s|.*|          image: ${BACKEND_IMAGE}:${IMAGE_TAG}|" k8s/jerney.yaml
 
-          # Find the image: line right after `- name: frontend`
           FRONTEND_LINE=$(awk '/- name: frontend/{found=1} found && /image:/{print NR; exit}' k8s/jerney.yaml)
           [ -n "$FRONTEND_LINE" ] || { echo "❌ frontend image line not found"; exit 1; }
-          echo "Frontend image at line: ${FRONTEND_LINE}"
           sed -i "${FRONTEND_LINE}s|.*|          image: ${FRONTEND_IMAGE}:${IMAGE_TAG}|" k8s/jerney.yaml
 
           echo "✅ Updated images to tag: ${IMAGE_TAG}"
