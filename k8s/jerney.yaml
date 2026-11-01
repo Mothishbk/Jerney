@@ -200,7 +200,7 @@ spec:
               echo "DB is ready!"
       containers:
         - name: backend
-          image: ghcr.io/mothishbk/jerney/jerney-backend:25b39ed
+          image: ghcr.io/mothishbk/jerney/jerney-backend:3d5ee70
           ports:
             - containerPort: 5000
               protocol: TCP
@@ -307,7 +307,7 @@ spec:
           effect: "NoSchedule"
       containers:
         - name: frontend
-          image: ghcr.io/mothishbk/jerney/jerney-frontend:25b39ed
+          image: ghcr.io/mothishbk/jerney/jerney-frontend:3d5ee70
           ports:
             - containerPort: 8080
               protocol: TCP
