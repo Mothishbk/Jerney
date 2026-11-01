@@ -2,33 +2,72 @@
 # Jerney - DevSecOps CI/CD Pipeline
 # ==============================================================
 # Triggers on every push and pull request.
-# Stages: Lint → SCA → Build → Image Scan → IaC Scan → Deploy Manifest Update
+#
+# Flow:
+#   1. Secret Scan (Gitleaks)
+#   2. Lint (ESLint)                 ─┐
+#   3. SAST (SonarQube + Quality Gate)│  run in parallel after secret scan
+#   4. SCA (npm audit + Trivy fs)    │
+#   5. Dockerfile Lint (Hadolint)    │
+#   6. IaC Scan (Checkov)            ─┘
+#   7. Build, Push, SBOM, Sign (Cosign)
+#   8. Image Scan (Dockle CIS benchmark + Trivy vulnerabilities)
+#   9. Update K8s Manifest (devops branch only)
+#
+# Required repo secrets:
+#   SONAR_TOKEN      - SonarQube user/project token
+#   SONAR_HOST_URL   - e.g. http://<sonarqube-ip>:9000
+# GITHUB_TOKEN is provided automatically.
 # ==============================================================
 
 name: Jerney DevSecOps Pipeline
 
 on:
   push:
-    branches: ["*"]
+    branches: ["**"] # "**" also matches branches with slashes (feature/x)
   pull_request:
-    branches: ["*"]
+    branches: ["**"]
 
 # Security: restrict default permissions to read-only
 permissions:
   contents: read
 
+# Cancel older runs of the same branch so two runs never race on the manifest
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   DOCKER_REGISTRY: ghcr.io
-  BACKEND_IMAGE: ghcr.io/${{ github.repository }}/jerney-backend
-  FRONTEND_IMAGE: ghcr.io/${{ github.repository }}/jerney-frontend
+  NODE_VERSION: "20"
 
 jobs:
+  # ==============================================================
+  # STAGE 0: Secret Scanning (Gitleaks)
+  # Scans full git history for hardcoded keys, tokens, passwords
+  # ==============================================================
+  secret-scan:
+    name: "🔑 Secret Scan (Gitleaks)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}  # only needed for org-owned repos
+
   # ==============================================================
   # STAGE 1: Linting
   # ==============================================================
   lint:
     name: "🔍 Lint Code"
     runs-on: ubuntu-latest
+    needs: secret-scan
     continue-on-error: true
     strategy:
       matrix:
@@ -40,7 +79,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: ${{ env.NODE_VERSION }}
           cache: "npm"
           cache-dependency-path: "${{ matrix.component }}/package-lock.json"
 
@@ -51,6 +90,35 @@ jobs:
       - name: Run ESLint
         working-directory: ${{ matrix.component }}
         run: npm run lint
+
+  # ==============================================================
+  # STAGE 1b: SAST — SonarQube Analysis + Quality Gate
+  # ==============================================================
+  sast-sonarqube:
+    name: "🧪 SAST (SonarQube)"
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    # Fork PRs don't receive secrets, so skip them instead of failing
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Checkout code (full history for blame/new-code detection)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=Jerney-app
+            -Dsonar.projectName=Jerney-app
+            -Dsonar.sources=backend,frontend
+            -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/build/**,**/*.test.js
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
 
   # ==============================================================
   # STAGE 2: Software Composition Analysis (SCA) — Dependency Audit
@@ -69,7 +137,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: ${{ env.NODE_VERSION }}
           cache: "npm"
           cache-dependency-path: "${{ matrix.component }}/package-lock.json"
 
@@ -83,16 +151,33 @@ jobs:
         run: npm audit --audit-level=high || true
         # `|| true` to not fail on moderate — adjust in prod
 
+      # Trivy filesystem scan: dependency vulns + leaked secrets
+      # (Dockerfile/K8s/Terraform misconfig is covered by Hadolint + Checkov)
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "./${{ matrix.component }}"
+          scanners: "vuln,secret"
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: "CRITICAL,HIGH"
+
   # ==============================================================
-  # STAGE 3: Build & Push Container Images
+  # STAGE 3: Build & Push Container Images (+ SBOM, provenance, signing)
+  # Gated on all code-level security checks
   # ==============================================================
   build:
     name: "🐳 Build ${{ matrix.component }}"
     runs-on: ubuntu-latest
-    needs: sca
+    needs: [sca, sast-sonarqube, dockerfile-lint, iac-scan]
+    # Run when nothing failed; still runs if SonarQube was skipped (fork PRs)
+    if: ${{ !failure() && !cancelled() }}
     permissions:
       contents: read
       packages: write # Needed to push to GHCR
+      id-token: write # Needed for keyless Cosign signing
     strategy:
       matrix:
         component: [backend, frontend]
@@ -104,6 +189,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -116,11 +202,12 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}/jerney-${{ matrix.component }}
           tags: |
-            type=sha,prefix=
+            type=sha,prefix=,format=short
             type=ref,event=branch
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push image
+        id: push
         uses: docker/build-push-action@v6
         with:
           context: ./${{ matrix.component }}
@@ -128,20 +215,35 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
           # Security: provenance and SBOM
           provenance: true
           sbom: true
 
+      - name: Install Cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless, by digest)
+        if: github.event_name != 'pull_request'
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}/jerney-${{ matrix.component }}"
+          cosign sign --yes "${IMAGE}@${{ steps.push.outputs.digest }}"
+
   # ==============================================================
-  # STAGE 4: Container Image Scanning (Trivy)
+  # STAGE 4: Container Image Scanning (Dockle + Trivy)
+  # On push: scans the exact image pushed to GHCR.
+  # On PR: builds locally (nothing was pushed) and scans that.
   # ==============================================================
   image-scan:
     name: "🔬 Scan ${{ matrix.component }} Image"
     runs-on: ubuntu-latest
     continue-on-error: true
     needs: build
+    permissions:
+      contents: read
+      packages: read
     strategy:
       matrix:
         component: [backend, frontend]
@@ -149,14 +251,46 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Build image for scanning
+      - name: Resolve image reference
+        id: ref
         run: |
-          docker build -t jerney-${{ matrix.component }}:scan ./${{ matrix.component }}
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "image=jerney-${{ matrix.component }}:scan" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/jerney-${{ matrix.component }}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR (pull pushed image)
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image for scanning (PR only)
+        if: github.event_name == 'pull_request'
+        run: docker build -t ${{ steps.ref.outputs.image }} ./${{ matrix.component }}
+
+      - name: Pull pushed image (push only)
+        if: github.event_name != 'pull_request'
+        run: docker pull ${{ steps.ref.outputs.image }}
+
+      # Dockle: CIS Docker Benchmark + best-practice checks on the built image
+      # (root user, secrets in ENV, setuid files, missing HEALTHCHECK, etc.)
+      - name: Run Dockle image linter
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            goodwithtech/dockle:v0.4.15 \
+            --exit-code 1 \
+            --exit-level fatal \
+            ${{ steps.ref.outputs.image }}
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: "jerney-${{ matrix.component }}:scan"
+          image-ref: ${{ steps.ref.outputs.image }}
           format: "table"
           exit-code: "1"
           ignore-unfixed: true
@@ -182,7 +316,7 @@ jobs:
           directory: terraform/
           framework: terraform
           soft_fail: false
-          skip_check: CKV_AWS_39,CKV_AWS_58  # Public EKS endpoint (intentional for dev)
+          skip_check: CKV_AWS_39,CKV_AWS_58 # Public EKS endpoint (intentional for dev)
           output_format: cli
 
       - name: Run Checkov on Kubernetes manifests
@@ -190,7 +324,7 @@ jobs:
         with:
           directory: k8s/
           framework: kubernetes
-          soft_fail: true  # Soft fail for K8s (some checks may not apply)
+          soft_fail: true # Soft fail for K8s (some checks may not apply)
           output_format: cli
 
   # ==============================================================
@@ -199,6 +333,7 @@ jobs:
   dockerfile-lint:
     name: "📋 Dockerfile Lint"
     runs-on: ubuntu-latest
+    needs: secret-scan
     continue-on-error: true
     strategy:
       matrix:
@@ -215,12 +350,13 @@ jobs:
 
   # ==============================================================
   # STAGE 7: Update K8s Manifest with New Image Tag
-  # Only runs on push to main (not on PRs)
+  # Only runs on push to devops (the DevSecOps branch), AFTER images are built and scanned
   # ==============================================================
   update-manifest:
     name: "🚀 Update K8s Manifest"
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' 
+    needs: [build, image-scan]
+    if: ${{ !failure() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/devops' }}
     permissions:
       contents: write # Needed to push manifest changes
     steps:
@@ -229,23 +365,31 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Get short SHA
-        id: sha
-        run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+      - name: Compute image tag and names
+        id: vars
+        run: |
+          # Same 7-char SHA that docker/metadata-action used for the tag
+          echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          # GHCR requires lowercase repository paths
+          echo "prefix=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
       - name: Update K8s manifest with new image tags
+        env:
+          IMAGE_TAG: ${{ steps.vars.outputs.tag }}
+          BACKEND_IMAGE: ${{ steps.vars.outputs.prefix }}/jerney-backend
+          FRONTEND_IMAGE: ${{ steps.vars.outputs.prefix }}/jerney-frontend
         run: |
-          IMAGE_TAG=${{ steps.sha.outputs.short }}
+          set -euo pipefail
 
-          # Find the line number of the backend container image
-          # (the image: line right after `- name: backend`)
+          # Find the image: line right after `- name: backend`
           BACKEND_LINE=$(awk '/- name: backend/{found=1} found && /image:/{print NR; exit}' k8s/jerney.yaml)
+          [ -n "$BACKEND_LINE" ] || { echo "❌ backend image line not found"; exit 1; }
           echo "Backend image at line: ${BACKEND_LINE}"
           sed -i "${BACKEND_LINE}s|.*|          image: ${BACKEND_IMAGE}:${IMAGE_TAG}|" k8s/jerney.yaml
 
-          # Find the line number of the frontend container image
-          # (the image: line right after `- name: frontend`)
+          # Find the image: line right after `- name: frontend`
           FRONTEND_LINE=$(awk '/- name: frontend/{found=1} found && /image:/{print NR; exit}' k8s/jerney.yaml)
+          [ -n "$FRONTEND_LINE" ] || { echo "❌ frontend image line not found"; exit 1; }
           echo "Frontend image at line: ${FRONTEND_LINE}"
           sed -i "${FRONTEND_LINE}s|.*|          image: ${FRONTEND_IMAGE}:${IMAGE_TAG}|" k8s/jerney.yaml
 
@@ -257,5 +401,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add k8s/jerney.yaml
-          git diff --cached --quiet || git commit -m "ci: update k8s images to ${{ steps.sha.outputs.short }} [skip ci]"
-          git push
+          if git diff --cached --quiet; then
+            echo "No manifest changes"
+            exit 0
+          fi
+          git commit -m "ci: update k8s images to ${{ steps.vars.outputs.tag }} [skip ci]"
+          git pull --rebase origin devops
+          git push origin HEAD:devops
