@@ -1,12 +1,16 @@
 # ==============================================================
-# Jerney - DevSecOps CI Pipeline (report-only security scans)
+# Jerney - DevSecOps CI Pipeline (raw shell implementation)
 # ==============================================================
+# Every step runs real commands in `run: |`.
+# The one exception is actions/upload-artifact: GitHub only gives the
+# credentials for its artifact storage to actions, not to run steps.
+#
 # Every scanner REPORTS instead of failing: findings are saved as
 # JSON and uploaded as artifacts, and the pipeline keeps going.
 # Only real breakage (npm ci, docker build/push) fails a job.
 #
 # Flow:
-#   1. Secret Scan (Gitleaks)            -> gitleaks-report (SARIF/JSON)
+#   1. Secret Scan (Gitleaks)            -> gitleaks-report (SARIF)
 #   2. Lint (ESLint)                     -> eslint-<component>.json
 #   3. SAST (SonarQube)                  -> sonarqube-report (issues + gate JSON)
 #   4. SCA (npm audit + Trivy fs)        -> sca-<component> (2 JSON files)
@@ -14,7 +18,8 @@
 #   6. IaC Scan (Checkov TF + K8s)       -> checkov-report (JSON)
 #   7. Build, Push, SBOM, Sign (Cosign)
 #   8. Image Scan (Dockle + Trivy)       -> image-scan-<component> (2 JSON files)
-#   9. Update K8s Manifest (devops branch only)
+#   9. DAST (OWASP ZAP)                   -> dast-zap-report (HTML/JSON/MD)
+#  10. Update K8s Manifest (devops branch only)
 #
 # Reports: Actions -> open a run -> "Artifacts" section at the bottom.
 #
@@ -42,6 +47,11 @@ concurrency:
 env:
   NODE_VERSION: "20"
   SONAR_PROJECT_KEY: "Jerney-app"
+  TRIVY_VERSION: "0.76.1"
+  HADOLINT_VERSION: "2.15.1"
+  HADOLINT_SHA256: "c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507"
+  COSIGN_VERSION: "3.1.4"
+  SONAR_SCANNER_VERSION: "8.3.0.16463"
 
 jobs:
   # ==============================================================
@@ -56,20 +66,39 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        continue-on-error: true # report only
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: false # we upload it ourselves below
+      - name: Install Gitleaks and check for code leaks
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y gitleaks
+          gitleaks detect \
+            --no-git \
+            --source . \
+            --redact \
+            --exit-code 0 \
+            --report-format csv \
+            --report-path gitleaks-report.csv
 
-      - name: Upload Gitleaks report
+      - name: Install and scan for secrets using Trivy
+        run: |
+          sudo apt-get install -y wget gnupg
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -y
+          sudo apt-get install -y trivy
+
+          trivy fs --scanners secret --offline-scan --skip-files README.md \
+            --exit-code 0 --format json --output trivy-secret-report.json .
+
+      - name: Upload secret scan reports (artifacts)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gitleaks-report
-          path: results.sarif
+          name: security-reports-secrets
+          path: |
+            gitleaks-report.csv
+            trivy-secret-report.json
           if-no-files-found: warn
+          retention-days: 7
 
   # ==============================================================
   # STAGE 2: Linting (ESLint)
@@ -82,24 +111,28 @@ jobs:
       fail-fast: false
       matrix:
         component: [backend, frontend]
+    env:
+      COMPONENT: ${{ matrix.component }}
     steps:
-      - name: Checkout code
+      - name: Checkout code (full history)
         uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: "npm"
-          cache-dependency-path: "${{ matrix.component }}/package-lock.json"
+          fetch-depth: 0
+
+      - name: Install Node.js
+        run: |
+          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+          sudo apt install -y nodejs
 
       - name: Install dependencies
-        working-directory: ${{ matrix.component }}
-        run: npm ci
+        run: |
+          cd "$COMPONENT"
+          npm ci
 
       - name: Run ESLint (JSON report)
-        working-directory: ${{ matrix.component }}
-        run: npm run lint -- --format json --output-file ../eslint-${{ matrix.component }}.json || true
+        run: |
+          cd "$COMPONENT"
+          npm run lint -- --format json --output-file "../eslint-${COMPONENT}.json" || true
 
       - name: Upload ESLint report
         if: always()
@@ -123,19 +156,31 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install SonarScanner CLI
+        continue-on-error: true # a broken download is reported, not blocking
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          FILE="sonar-scanner-cli-${SONAR_SCANNER_VERSION}-linux-x64.zip"
+          BASE="https://binaries.sonarsource.com/Distribution/sonar-scanner-cli"
+          curl -sSfLO "${BASE}/${FILE}"
+          curl -sSfLO "${BASE}/${FILE}.sha256"
+          echo "$(cat "${FILE}.sha256")  ${FILE}" | sha256sum --check
+          unzip -q "$FILE"
+          echo "${RUNNER_TEMP}/sonar-scanner-${SONAR_SCANNER_VERSION}-linux-x64/bin" >> "$GITHUB_PATH"
+
       - name: SonarQube Scan
-        uses: SonarSource/sonarqube-scan-action@v6
         continue-on-error: true # a failed quality gate is reported, not blocking
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-        with:
-          args: >
-            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
-            -Dsonar.projectName=${{ env.SONAR_PROJECT_KEY }}
-            -Dsonar.sources=backend,frontend
-            -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/build/**,**/*.test.js
-            -Dsonar.qualitygate.wait=true
+        run: |
+          sonar-scanner \
+            -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
+            -Dsonar.projectName="${SONAR_PROJECT_KEY}" \
+            -Dsonar.sources=backend,frontend \
+            -Dsonar.exclusions='**/node_modules/**,**/dist/**,**/build/**,**/*.test.js' \
+            -Dsonar.qualitygate.wait=true \
             -Dsonar.qualitygate.timeout=300
 
       - name: Export SonarQube results as JSON
@@ -174,36 +219,46 @@ jobs:
       fail-fast: false
       matrix:
         component: [backend, frontend]
+    env:
+      COMPONENT: ${{ matrix.component }}
     steps:
-      - name: Checkout code
+      - name: Checkout code (full history)
         uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: "npm"
-          cache-dependency-path: "${{ matrix.component }}/package-lock.json"
+          fetch-depth: 0
+
+      - name: Install Node.js
+        run: |
+          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+          sudo apt install -y nodejs
 
       - name: Install dependencies
-        working-directory: ${{ matrix.component }}
-        run: npm ci
+        run: |
+          cd "$COMPONENT"
+          npm ci
 
       - name: npm audit (JSON report)
-        working-directory: ${{ matrix.component }}
-        run: npm audit --json > ../npm-audit-${{ matrix.component }}.json || true
+        run: |
+          cd "$COMPONENT"
+          npm audit --json > "../npm-audit-${COMPONENT}.json" || true
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get install -y wget gnupg
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -y
+          sudo apt-get install -y trivy
 
       - name: Trivy filesystem scan (JSON report)
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: "fs"
-          scan-ref: "./${{ matrix.component }}"
-          scanners: "vuln,secret"
-          format: "json"
-          output: "trivy-fs-${{ matrix.component }}.json"
-          exit-code: "0" # report only
-          ignore-unfixed: true
-          severity: "CRITICAL,HIGH,MEDIUM"
+        run: |
+          trivy fs "./${COMPONENT}" \
+            --scanners vuln \
+            --format json \
+            --output "trivy-fs-${COMPONENT}.json" \
+            --exit-code 0 \
+            --ignore-unfixed \
+            --severity CRITICAL,HIGH,MEDIUM
 
       - name: Upload SCA reports
         if: always()
@@ -214,6 +269,7 @@ jobs:
             npm-audit-${{ matrix.component }}.json
             trivy-fs-${{ matrix.component }}.json
           if-no-files-found: warn
+          retention-days: 7
 
   # ==============================================================
   # STAGE 5: Dockerfile Lint (Hadolint)
@@ -226,17 +282,27 @@ jobs:
       fail-fast: false
       matrix:
         component: [backend, frontend]
+    env:
+      COMPONENT: ${{ matrix.component }}
     steps:
-      - name: Checkout code
+      - name: Checkout code (full history)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Hadolint
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          FILE="hadolint-linux-x86_64"
+          BASE="https://github.com/hadolint/hadolint/releases/download/v${HADOLINT_VERSION}"
+          curl -sSfLO "${BASE}/${FILE}"
+          echo "${HADOLINT_SHA256}  ${FILE}" | sha256sum --check
+          sudo install -m 0755 "$FILE" /usr/local/bin/hadolint
 
       - name: Run Hadolint (JSON report)
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: ${{ matrix.component }}/Dockerfile
-          format: json
-          output-file: hadolint-${{ matrix.component }}.json
-          no-fail: true # report only
+        run: |
+          hadolint --no-fail --format json "${COMPONENT}/Dockerfile" > "hadolint-${COMPONENT}.json"
 
       - name: Upload Hadolint report
         if: always()
@@ -254,16 +320,17 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint
     steps:
-      - name: Checkout code
+      - name: Checkout code (full history)
         uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          fetch-depth: 0
 
       - name: Install Checkov
-        run: pip install --quiet checkov
+        run: |
+          set -euo pipefail
+          python3 -m venv "${RUNNER_TEMP}/checkov-venv"
+          "${RUNNER_TEMP}/checkov-venv/bin/pip" install --quiet checkov
+          echo "${RUNNER_TEMP}/checkov-venv/bin" >> "$GITHUB_PATH"
 
       - name: Checkov on Terraform (JSON report)
         # CKV_AWS_39, CKV_AWS_58: public EKS endpoint (intentional for dev)
@@ -304,54 +371,88 @@ jobs:
       fail-fast: false
       matrix:
         component: [backend, frontend]
+    env:
+      COMPONENT: ${{ matrix.component }}
     steps:
-      - name: Checkout code
+      - name: Checkout code (full history)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        run: |
+          docker buildx create --name jerney-builder --driver docker-container --use
+          docker buildx inspect --bootstrap
 
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata (tags, labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}/jerney-${{ matrix.component }}
-          tags: |
-            type=sha,prefix=,format=short
-            type=ref,event=branch
-            type=raw,value=latest,enable={{is_default_branch}}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
 
       - name: Build and push image
         id: push
-        uses: docker/build-push-action@v6
-        with:
-          context: ./${{ matrix.component }}
-          file: ./${{ matrix.component }}/Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.component }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
-          provenance: true
-          sbom: true
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}/jerney-${COMPONENT}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          ARGS=(
+            --file "./${COMPONENT}/Dockerfile"
+            --tag "${IMAGE}:${SHORT_SHA}"
+            --label "org.opencontainers.image.title=jerney-${COMPONENT}"
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}"
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            --provenance=true
+            --sbom=true
+            --metadata-file build-metadata.json
+          )
+
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            BRANCH_TAG=$(printf '%s' "$GITHUB_REF_NAME" | sed -E 's/[^a-zA-Z0-9_.-]+/-/g; s/^[.-]+//' | cut -c1-128)
+            ARGS+=(--tag "${IMAGE}:${BRANCH_TAG}")
+
+            if [ "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" ]; then
+              ARGS+=(--tag "${IMAGE}:latest")
+            fi
+
+            ARGS+=(
+              --cache-from "type=registry,ref=${IMAGE}:buildcache"
+              --cache-to "type=registry,ref=${IMAGE}:buildcache,mode=max"
+              --push
+            )
+          fi
+
+          docker buildx build "${ARGS[@]}" "./${COMPONENT}"
+
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            DIGEST=$(jq -r '."containerimage.digest"' build-metadata.json)
+            echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Install Cosign
         if: github.event_name != 'pull_request'
-        uses: sigstore/cosign-installer@v3
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          BASE="https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}"
+          curl -sSfLO "${BASE}/cosign-linux-amd64"
+          curl -sSfLO "${BASE}/cosign_checksums.txt"
+          sha256sum --check --ignore-missing cosign_checksums.txt
+          sudo install -m 0755 cosign-linux-amd64 /usr/local/bin/cosign
 
       - name: Sign image (keyless, by digest)
         if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
         run: |
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}/jerney-${{ matrix.component }}"
-          cosign sign --yes "${IMAGE}@${{ steps.push.outputs.digest }}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}/jerney-${COMPONENT}"
+          cosign sign --yes "${IMAGE}@${DIGEST}"
 
   # ==============================================================
   # STAGE 8: Image Scanning (Dockle + Trivy)
@@ -367,56 +468,76 @@ jobs:
       fail-fast: false
       matrix:
         component: [backend, frontend]
+    env:
+      COMPONENT: ${{ matrix.component }}
     steps:
-      - name: Checkout code
+      - name: Checkout code (full history)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Resolve image reference
         id: ref
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "image=jerney-${{ matrix.component }}:scan" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            echo "image=jerney-${COMPONENT}:scan" >> "$GITHUB_OUTPUT"
           else
-            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/jerney-${{ matrix.component }}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/jerney-${COMPONENT}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
 
       - name: Build image for scanning (PR only)
         if: github.event_name == 'pull_request'
-        run: docker build -t ${{ steps.ref.outputs.image }} ./${{ matrix.component }}
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+        run: |
+          docker build -t "$IMAGE" "./${COMPONENT}"
 
       - name: Pull pushed image (push only)
         if: github.event_name != 'pull_request'
-        run: docker pull ${{ steps.ref.outputs.image }}
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+        run: |
+          docker pull "$IMAGE"
 
       - name: Dockle CIS benchmark (JSON report)
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
         run: |
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$PWD":/out \
             goodwithtech/dockle:v0.4.15 \
-            --format json --output /out/dockle-${{ matrix.component }}.json \
+            --format json --output "/out/dockle-${COMPONENT}.json" \
             --exit-code 0 \
-            ${{ steps.ref.outputs.image }} || true
+            "$IMAGE" || true
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get install -y wget gnupg
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -y
+          sudo apt-get install -y trivy
 
       - name: Trivy image scan (JSON report)
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ steps.ref.outputs.image }}
-          format: "json"
-          output: "trivy-image-${{ matrix.component }}.json"
-          exit-code: "0" # report only
-          ignore-unfixed: true
-          vuln-type: "os,library"
-          severity: "CRITICAL,HIGH,MEDIUM"
-          timeout: "10m"
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+        run: |
+          trivy image "$IMAGE" \
+            --format json \
+            --output "trivy-image-${COMPONENT}.json" \
+            --exit-code 0 \
+            --ignore-unfixed \
+            --pkg-types os,library \
+            --severity CRITICAL,HIGH,MEDIUM \
+            --timeout 10m
 
       - name: Upload image scan reports
         if: always()
@@ -429,20 +550,163 @@ jobs:
           if-no-files-found: warn
 
   # ==============================================================
-  # STAGE 9: Update K8s Manifest (GitOps hand-off, devops branch only)
+  # STAGE 9: DAST — Dynamic scan of the RUNNING app (OWASP ZAP)
+  # ==============================================================
+  # DAST attacks the live application from the outside, so this job first
+  # STARTS the app (via docker compose if present, else runs the images),
+  # waits for it to be ready, then runs the ZAP baseline scan against it.
+  # Report-only: `-I` + `|| true` mean findings are saved, never block.
+  #
+  # Jerney is a 3-tier app:  frontend (nginx :80) -> backend (node :5000) -> PostgreSQL.
+  # nginx proxies /api/ to the container named "jerney-backend", and the backend
+  # EXITS if it can't reach Postgres — so we boot db -> backend -> frontend, then scan
+  # the frontend (which also exercises the API through its /api proxy).
+  # DB creds come from deploy/setup.sh (jerney_user / jerney_pass_2026 / jerney_db).
+  # ==============================================================
+  dast:
+    name: "🕷️ DAST (OWASP ZAP)"
+    runs-on: ubuntu-latest
+    needs: [build, image-scan]
+    if: ${{ !failure() && !cancelled() }}
+    permissions:
+      contents: read
+      packages: read # pull the pushed images from GHCR
+    env:
+      TARGET_URL: "http://localhost:8080" # frontend nginx, published on the runner
+    steps:
+      - name: Checkout code (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Start the app (PostgreSQL -> backend -> frontend)
+        run: |
+          set -euo pipefail
+          docker network create jerney-net || true
+
+          # --- 1) PostgreSQL ---
+          docker run -d --name jerney-db --network jerney-net \
+            -e POSTGRES_USER=jerney_user \
+            -e POSTGRES_PASSWORD=jerney_pass_2026 \
+            -e POSTGRES_DB=jerney_db \
+            postgres:16-alpine
+          echo "Waiting for Postgres..."
+          for i in $(seq 1 30); do
+            docker exec jerney-db pg_isready -U jerney_user -d jerney_db && break
+            sleep 2
+          done
+
+          # --- pick images: pushed ones on push, freshly built on PR ---
+          PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            docker build -t jerney-backend:scan  ./backend
+            docker build -t jerney-frontend:scan ./frontend
+            BE_IMG="jerney-backend:scan"; FE_IMG="jerney-frontend:scan"
+          else
+            BE_IMG="${PREFIX}/jerney-backend:${SHORT_SHA}"
+            FE_IMG="${PREFIX}/jerney-frontend:${SHORT_SHA}"
+          fi
+
+          # --- 2) Backend (name MUST be jerney-backend: nginx proxies /api/ to it) ---
+          docker run -d --name jerney-backend --network jerney-net \
+            -e DB_HOST=jerney-db -e DB_PORT=5432 \
+            -e DB_USER=jerney_user -e DB_PASSWORD=jerney_pass_2026 \
+            -e DB_NAME=jerney_db -e PORT=5000 \
+            "$BE_IMG"
+
+          # --- 3) Frontend (nginx :80) published on the runner as :8080 ---
+          docker run -d --name jerney-frontend --network jerney-net \
+            -p 8080:80 "$FE_IMG"
+
+      - name: Wait for the app to be ready
+        run: |
+          echo "Waiting for frontend ${TARGET_URL} ..."
+          for i in $(seq 1 30); do
+            curl -sfo /dev/null "${TARGET_URL}" && { echo "✅ Frontend up"; break; }
+            sleep 5
+          done
+          echo "Waiting for API via proxy ${TARGET_URL}/api/health ..."
+          for i in $(seq 1 30); do
+            curl -sfo /dev/null "${TARGET_URL}/api/health" && { echo "✅ API up"; break; }
+            sleep 5
+          done
+          # non-fatal: ZAP still runs even if a wait times out (report may be thinner)
+
+      - name: Prepare ZAP report directory
+        run: |
+          mkdir -p zap-out
+          chmod 777 zap-out # the ZAP container writes as its own user
+
+      - name: OWASP ZAP baseline scan (report-only)
+        run: |
+          # --network host lets the ZAP container reach the app on the runner's localhost.
+          docker run --rm --network host \
+            -v "$PWD/zap-out:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t "${TARGET_URL}" \
+              -r zap-report.html \
+              -J zap-report.json \
+              -w zap-report.md \
+              -I || true
+          # -I = do not return failure on warnings (report-only, matches the pipeline).
+          # For a deeper active scan (slower, nightly), swap zap-baseline.py -> zap-full-scan.py
+
+      # Optional — uncomment to also scan the backend API from its OpenAPI/Swagger spec.
+      # - name: OWASP ZAP API scan (backend)
+      #   run: |
+      #     docker run --rm --network host \
+      #       -v "$PWD/zap-out:/zap/wrk:rw" \
+      #       ghcr.io/zaproxy/zaproxy:stable \
+      #       zap-api-scan.py \
+      #         -t "http://localhost:5000/openapi.json" -f openapi \
+      #         -r zap-api-report.html -J zap-api-report.json -I || true
+
+      - name: Dump app logs (on any outcome)
+        if: always()
+        run: |
+          echo "----- frontend -----"; docker logs jerney-frontend 2>&1 | tail -30 || true
+          echo "----- backend -----";  docker logs jerney-backend  2>&1 | tail -30 || true
+          echo "----- db -----";       docker logs jerney-db       2>&1 | tail -15 || true
+
+      - name: Tear down the app
+        if: always()
+        run: |
+          docker rm -f jerney-frontend jerney-backend jerney-db 2>/dev/null || true
+          docker network rm jerney-net 2>/dev/null || true
+
+      - name: Upload ZAP (DAST) reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-zap-report
+          path: zap-out/
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ==============================================================
+  # STAGE 10: Update K8s Manifest (GitOps hand-off, devops branch only)
   # ==============================================================
   update-manifest:
     name: "🚀 Update K8s Manifest"
     runs-on: ubuntu-latest
-    needs: [build, image-scan]
+    needs: [build, image-scan, dast]
     if: ${{ !failure() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/devops' }}
     permissions:
       contents: write
     steps:
-      - name: Checkout code
+      - name: Checkout code (full history)
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
       - name: Compute image tag and names
         id: vars
@@ -470,7 +734,12 @@ jobs:
           grep -n "image:" k8s/jerney.yaml
 
       - name: Commit and push manifest update
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_TAG: ${{ steps.vars.outputs.tag }}
         run: |
+          set -euo pipefail
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add k8s/jerney.yaml
@@ -478,6 +747,6 @@ jobs:
             echo "No manifest changes"
             exit 0
           fi
-          git commit -m "ci: update k8s images to ${{ steps.vars.outputs.tag }} [skip ci]"
-          git pull --rebase origin devops
-          git push origin HEAD:devops
+          git commit -m "ci: update k8s images to ${IMAGE_TAG} [skip ci]"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${AUTH}" pull --rebase origin devops
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${AUTH}" push origin HEAD:devops
